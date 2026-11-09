@@ -31,6 +31,7 @@ cc_library_shared {
     ],
     include_dirs: [
         "hardware/samsung_slsi-linaro/exynos/include",
+        "hardware/samsung_slsi-linaro/exynos/kernel-5.15-headers/kernel-headers",
     ],
     export_include_dirs: ["."],
     srcs: [
