@@ -32,8 +32,52 @@ using arm::mapper::common::shared_metadata;
 #define UNUSED(x) ((void)x)
 #define SZ_4k 0x1000
 
+#ifdef GRALLOC_LEGACY_V3_HANDLE
+/*
+ * Only the wire block of a legacy v3 handle travels between processes. A C2
+ * handle (C2HandleGralloc) is built from the fds/ints of the handle only, so
+ * the gralloc4 extension (fd_count, plane_info, alloc_sizes, attr_size) is not
+ * valid on it. Rebuild the extension on a local copy of the wire block.
+ */
+class HandleView {
+  public:
+    explicit HandleView(buffer_handle_t hnd) {
+        if (hnd == nullptr)
+            return;
+
+        constexpr size_t wireSize = sizeof(native_handle) + PRIVATE_HANDLE_V3_WIRE_INTS * sizeof(int);
+
+        if ((size_t)(hnd->numFds + hnd->numInts) < PRIVATE_HANDLE_V3_WIRE_INTS)
+            return;
+
+        memset(mStorage, 0, sizeof(mStorage));
+        memcpy(mStorage, hnd, wireSize);
+
+        auto *view = reinterpret_cast<private_handle_t *>(mStorage);
+        if (view->magic != private_handle_t::sMagic)
+            return;
+
+        view->numInts = PRIVATE_HANDLE_V3_WIRE_INTS - view->numFds;
+        view->rebuild_ext_from_wire();
+        mView = view;
+    }
+
+    const private_handle_t *get() const { return mView; }
+
+  private:
+    alignas(private_handle_t) char mStorage[sizeof(private_handle_t)];
+    const private_handle_t *mView = nullptr;
+};
+
+#define GRALLOC_HND(__var__, __hnd__)                                                                                  \
+    HandleView __var__##_view(__hnd__);                                                                                \
+    const private_handle_t *__var__ = __var__##_view.get()
+#else
+#define GRALLOC_HND(__var__, __hnd__) const private_handle_t *__var__ = static_cast<const private_handle_t *>(__hnd__)
+#endif
+
 uint64_t ExynosGraphicBufferMeta::get_metadata_size(buffer_handle_t hnd) {
-    const private_handle_t *gralloc_hnd = static_cast<const private_handle_t *>(hnd);
+    GRALLOC_HND(gralloc_hnd, hnd);
 
     if (!gralloc_hnd) {
         ALOGE("gralloc handle is null");
@@ -44,7 +88,7 @@ uint64_t ExynosGraphicBufferMeta::get_metadata_size(buffer_handle_t hnd) {
 }
 
 int ExynosGraphicBufferMeta::get_video_metadata_fd(buffer_handle_t hnd) {
-    const private_handle_t *gralloc_hnd = static_cast<const private_handle_t *>(hnd);
+    GRALLOC_HND(gralloc_hnd, hnd);
 
     if (!gralloc_hnd)
         return -EINVAL;
@@ -57,8 +101,15 @@ int ExynosGraphicBufferMeta::get_video_metadata_fd(buffer_handle_t hnd) {
         return -EINVAL;
 }
 
+#ifdef GRALLOC_LEGACY_V3_HANDLE
+/* shared_metadata lives behind the gralloc3 attr_region that the vendor blobs read */
+static constexpr size_t kSharedMetadataOffset = private_handle_t::kAttrPrefix;
+#else
+static constexpr size_t kSharedMetadataOffset = 0;
+#endif
+
 int ExynosGraphicBufferMeta::get_dataspace(buffer_handle_t hnd) {
-    const private_handle_t *gralloc_hnd = static_cast<const private_handle_t *>(hnd);
+    GRALLOC_HND(gralloc_hnd, hnd);
 
     if (!gralloc_hnd)
         return -1;
@@ -68,18 +119,23 @@ int ExynosGraphicBufferMeta::get_dataspace(buffer_handle_t hnd) {
     if (attr_fd < 0)
         return -1;
 
-    shared_metadata *metadata = (shared_metadata *)mmap(0, sizeof(shared_metadata), PROT_READ, MAP_SHARED, attr_fd, 0);
+    constexpr size_t mapSize = kSharedMetadataOffset + sizeof(shared_metadata);
+    void *map = mmap(0, mapSize, PROT_READ, MAP_SHARED, attr_fd, 0);
+    if (map == MAP_FAILED)
+        return -1;
+
+    auto *metadata = reinterpret_cast<shared_metadata *>(static_cast<char *>(map) + kSharedMetadataOffset);
     std::optional<Dataspace> dataspace = metadata->dataspace.to_std_optional();
 
     int32_t ret = static_cast<int32_t>(dataspace.value_or(Dataspace::UNKNOWN));
 
-    munmap(metadata, sizeof(shared_metadata));
+    munmap(map, mapSize);
 
     return ret;
 }
 
 int ExynosGraphicBufferMeta::set_dataspace(buffer_handle_t hnd, android_dataspace_t dataspace) {
-    const private_handle_t *gralloc_hnd = static_cast<const private_handle_t *>(hnd);
+    GRALLOC_HND(gralloc_hnd, hnd);
 
     if (!gralloc_hnd)
         return -1;
@@ -89,16 +145,24 @@ int ExynosGraphicBufferMeta::set_dataspace(buffer_handle_t hnd, android_dataspac
     if (attr_fd < 0)
         return -1;
 
-    shared_metadata *metadata =
-        (shared_metadata *)mmap(0, sizeof(shared_metadata), PROT_READ | PROT_WRITE, MAP_SHARED, attr_fd, 0);
+    constexpr size_t mapSize = kSharedMetadataOffset + sizeof(shared_metadata);
+    void *map = mmap(0, mapSize, PROT_READ | PROT_WRITE, MAP_SHARED, attr_fd, 0);
+    if (map == MAP_FAILED)
+        return -1;
+
+    auto *metadata = reinterpret_cast<shared_metadata *>(static_cast<char *>(map) + kSharedMetadataOffset);
     metadata->dataspace = static_cast<Dataspace>(dataspace);
-    munmap(metadata, sizeof(shared_metadata));
+#ifdef GRALLOC_LEGACY_V3_HANDLE
+    /* the vendor blobs read the dataspace from the gralloc3 attr_region */
+    static_cast<attr_region_v3_t *>(map)->dataspace = static_cast<int>(dataspace);
+#endif
+    munmap(map, mapSize);
 
     return 0;
 }
 
 int ExynosGraphicBufferMeta::is_afbc(buffer_handle_t hnd) {
-    const private_handle_t *gralloc_hnd = static_cast<const private_handle_t *>(hnd);
+    GRALLOC_HND(gralloc_hnd, hnd);
 
     if (!gralloc_hnd)
         return 0;
@@ -127,14 +191,14 @@ GRALLOC_META_NO_IMPL(bool, get_sub_valid);
 
 #define GRALLOC_META_GETTER(__type__, __name__, __member__)                                                            \
     __type__ ExynosGraphicBufferMeta::get_##__name__(buffer_handle_t hnd) {                                            \
-        const private_handle_t *gralloc_hnd = static_cast<const private_handle_t *>(hnd);                              \
+        GRALLOC_HND(gralloc_hnd, hnd);                              \
         if (!gralloc_hnd)                                                                                              \
             return 0;                                                                                                  \
         return gralloc_hnd->__member__;                                                                                \
     }
 
 uint32_t ExynosGraphicBufferMeta::get_format(buffer_handle_t hnd) {
-    const private_handle_t *gralloc_hnd = static_cast<const private_handle_t *>(hnd);
+    GRALLOC_HND(gralloc_hnd, hnd);
     if (!gralloc_hnd)
         return 0;
 
@@ -142,7 +206,7 @@ uint32_t ExynosGraphicBufferMeta::get_format(buffer_handle_t hnd) {
 }
 
 uint64_t ExynosGraphicBufferMeta::get_internal_format(buffer_handle_t hnd) {
-    const private_handle_t *gralloc_hnd = static_cast<const private_handle_t *>(hnd);
+    GRALLOC_HND(gralloc_hnd, hnd);
     if (!gralloc_hnd)
         return 0;
 
@@ -164,7 +228,7 @@ GRALLOC_META_GETTER(uint64_t, consumer_usage, consumer_usage);
 GRALLOC_META_GETTER(uint64_t, flags, flags);
 
 uint32_t ExynosGraphicBufferMeta::get_cstride(buffer_handle_t hnd) {
-    const private_handle_t *gralloc_hnd = static_cast<const private_handle_t *>(hnd);
+    GRALLOC_HND(gralloc_hnd, hnd);
 
     if (!gralloc_hnd)
         return 0;
@@ -178,7 +242,7 @@ uint32_t ExynosGraphicBufferMeta::get_cstride(buffer_handle_t hnd) {
 }
 
 int ExynosGraphicBufferMeta::get_fd(buffer_handle_t hnd, int num) {
-    const private_handle_t *gralloc_hnd = static_cast<const private_handle_t *>(hnd);
+    GRALLOC_HND(gralloc_hnd, hnd);
 
     if (!gralloc_hnd)
         return -1;
@@ -190,7 +254,7 @@ int ExynosGraphicBufferMeta::get_fd(buffer_handle_t hnd, int num) {
 }
 
 int ExynosGraphicBufferMeta::get_size(buffer_handle_t hnd, int num) {
-    const private_handle_t *gralloc_hnd = static_cast<const private_handle_t *>(hnd);
+    GRALLOC_HND(gralloc_hnd, hnd);
 
     if (!gralloc_hnd)
         return 0;
@@ -202,7 +266,7 @@ int ExynosGraphicBufferMeta::get_size(buffer_handle_t hnd, int num) {
 }
 
 uint64_t ExynosGraphicBufferMeta::get_usage(buffer_handle_t hnd) {
-    const private_handle_t *gralloc_hnd = static_cast<const private_handle_t *>(hnd);
+    GRALLOC_HND(gralloc_hnd, hnd);
 
     if (!gralloc_hnd)
         return 0;
@@ -216,7 +280,11 @@ void *ExynosGraphicBufferMeta::get_video_metadata(buffer_handle_t hnd) {
     if (!gralloc_hnd)
         return nullptr;
 
+#ifdef GRALLOC_LEGACY_V3_HANDLE
+    return gralloc_hnd->metadata_base();
+#else
     return gralloc_hnd->attr_base;
+#endif
 }
 
 void *ExynosGraphicBufferMeta::get_video_metadata_roiinfo(buffer_handle_t hnd) {
@@ -233,7 +301,7 @@ void *ExynosGraphicBufferMeta::get_video_metadata_roiinfo(buffer_handle_t hnd) {
 
 int ExynosGraphicBufferMeta::get_pad_align(buffer_handle_t hnd, pad_align_t *pad_align) {
     UNUSED(pad_align);
-    const private_handle_t *gralloc_hnd = static_cast<const private_handle_t *>(hnd);
+    GRALLOC_HND(gralloc_hnd, hnd);
 
     if (!gralloc_hnd)
         return -EINVAL;
@@ -242,7 +310,7 @@ int ExynosGraphicBufferMeta::get_pad_align(buffer_handle_t hnd, pad_align_t *pad
 }
 
 int64_t ExynosGraphicBufferMeta::get_plane_offset(buffer_handle_t hnd, int plane_num) {
-    const private_handle_t *gralloc_hnd = static_cast<const private_handle_t *>(hnd);
+    GRALLOC_HND(gralloc_hnd, hnd);
 
     if (!gralloc_hnd)
         return -EINVAL;
@@ -263,7 +331,7 @@ int ExynosGraphicBufferMeta::set_sub_valid(buffer_handle_t hnd, bool valid) {
 }
 
 void ExynosGraphicBufferMeta::dump_hnd(buffer_handle_t hnd, const char *str) {
-    const private_handle_t *gralloc_hnd = static_cast<const private_handle_t *>(hnd);
+    GRALLOC_HND(gralloc_hnd, hnd);
 
     if (!gralloc_hnd) {
         ALOGE("gralloc handle is null");
@@ -291,7 +359,7 @@ void ExynosGraphicBufferMeta::dump(const char *str) {
 }
 
 void ExynosGraphicBufferMeta::init(const buffer_handle_t handle) {
-    const private_handle_t *gralloc_hnd = static_cast<const private_handle_t *>(handle);
+    GRALLOC_HND(gralloc_hnd, handle);
 
     if (!gralloc_hnd)
         return;
