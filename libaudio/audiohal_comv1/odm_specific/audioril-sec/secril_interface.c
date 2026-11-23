@@ -128,6 +128,18 @@ static SoundType map_sound_from_device(AudioPath path)
     case SOUND_AUDIO_PATH_HEADSET:
         sound_type = SOUND_TYPE_HEADSET;
         break;
+    case SOUND_AUDIO_PATH_BLUETOOTH:
+    case SOUND_AUDIO_PATH_STEREO_BLUETOOTH:
+    case SOUND_AUDIO_PATH_BT_NS_EC_OFF:
+    case SOUND_AUDIO_PATH_WB_BLUETOOTH:
+    case SOUND_AUDIO_PATH_WB_BT_NS_EC_OFF:
+    case SOUND_AUDIO_PATH_VOLTE_BLUETOOTH:
+    case SOUND_AUDIO_PATH_VOLTE_STEREO_BLUETOOTH:
+    case SOUND_AUDIO_PATH_VOLTE_BT_NS_EC_OFF:
+    case SOUND_AUDIO_PATH_VOLTE_WB_BLUETOOTH:
+    case SOUND_AUDIO_PATH_VOLTE_WB_BT_NS_EC_OFF:
+        sound_type = SOUND_TYPE_BTVOICE;
+        break;
     case SOUND_AUDIO_PATH_HANDSET:
     default:
         sound_type = SOUND_TYPE_VOICE;
